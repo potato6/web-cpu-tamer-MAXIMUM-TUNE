@@ -8,7 +8,7 @@
 // @match               http://*/*
 // @exclude             /^https?://\S+\.(txt|png|jpg|jpeg|gif|xml|svg|manifest|log|ini)[^\/]*$/
 // @icon                https://raw.githubusercontent.com/cyfung1031/userscript-supports/7b34986ad9cdf3af8766e54b0aecb394b036e970/icons/web-cpu-tamer.svg
-// @supportURL          https://github.com/cyfung1031/userscript-supports
+// @updateURL           https://raw.githubusercontent.com/potato6/web-cpu-tamer-maximum-tune/main/web-cpu-tamer.user.js
 
 // @run-at              document-start
 // @inject-into         auto
@@ -18,11 +18,38 @@
 // @description         Reduce Browser's Energy Impact via implicit async scheduling delay (Zero-Allocation Edition)
 // ==/UserScript==
 
+/*
+
+MIT License
+
+Copyright 2025 CY Fung
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
 /* jshint esversion:8 */
 
 ((o) => {
     "use strict";
 
+    // --- cached native references (immutable shapes help the engine) ---
     const [
         setTimeout_,
         setInterval_,
@@ -31,33 +58,34 @@
         clearInterval_,
         cancelAnimationFrame_,
     ] = o;
+
     const queueMicrotask_ = queueMicrotask;
     const win =
         typeof unsafeWindow === "object"
             ? unsafeWindow
             : this instanceof Window
-              ? this
-              : window;
+                ? this
+                : window;
 
-    // cache global functions and constructors
     const MessageChannel_ = MessageChannel;
     const Error_ = Error;
-    const Set_ = Set;
-    const Promise_ = (async () => {})().constructor;
-    const Reflect_apply = Reflect.apply;
+    const Promise_ = (async () => { })().constructor;
     const performance_ = performance;
+    const DocumentTimeline_ = typeof DocumentTimeline === "function" ? DocumentTimeline : null;
 
-    const hkey_script = "nzsxclvflluv";
-    if (win[hkey_script]) throw new Error_("Duplicated Userscript Calling");
-    win[hkey_script] = true;
+    // --- single-key guard to avoid duplicate injections ---
+    const HKEY = "nzsxclvflluv";
+    if (win[HKEY]) throw new Error_("Duplicated Userscript Calling");
+    win[HKEY] = true;
 
-    // --- HEARTBEAT MECHANISM ---
-    let resolvePr = () => {},
-        pr;
-    const setPr = () =>
-        (pr = new Promise_((resolve) => {
+    // --- heartbeat (message-channel) ---
+    let resolvePr = () => { };
+    let pr;
+    const setPr = () => {
+        pr = new Promise_((resolve) => {
             resolvePr = resolve;
-        }));
+        });
+    };
     setPr();
 
     const mc = new MessageChannel_();
@@ -70,30 +98,39 @@
     };
 
     let lastPr = null;
+    const poke = () => {
+        if (lastPr !== pr) {
+            lastPr = pr;
+            port2.postMessage(0);
+        }
+    };
 
-    // --- TIMING SOURCE ---
+    // --- timing source (cache a getter) ---
     let getTimelineTime;
     {
-        let tl;
-        if (typeof DocumentTimeline === "function") {
-            tl = new DocumentTimeline();
-        } else if (typeof Animation === "function") {
-            try {
+        let tl = null;
+        try {
+            if (DocumentTimeline_) {
+                tl = new DocumentTimeline_();
+            } else if (typeof Animation === "function") {
+                // try animation timeline fallbacks
                 let e = document.documentElement;
                 if (e) {
-                    e = e.animate(null);
-                    if (e && typeof e === "object" && "_animation" in e) {
-                        e = e._animation; // YouTube compat
-                    }
-                    if (e && "timeline" in e) {
-                        tl = e.timeline;
+                    const anim = e.animate ? e.animate(null) : null;
+                    if (anim && "_animation" in anim) {
+                        // some sites expose a wrapped animation object
+                        tl = anim._animation && anim._animation.timeline;
+                    } else if (anim && "timeline" in anim) {
+                        tl = anim.timeline;
                     }
                 }
                 if (!tl) {
                     const ant = new Animation();
-                    tl = ant.timeline;
+                    tl = ant && ant.timeline;
                 }
-            } catch (err) {}
+            }
+        } catch (err) {
+            tl = null;
         }
 
         if (tl && Number.isFinite(tl.currentTime)) {
@@ -109,62 +146,116 @@
         }
     }
 
-    const tz = new Set_();
-    const az = new Set_();
+    // --- use plain object maps for fast numeric-keyed sets/maps (V8-optimized) ---
+    // Values: 1 = active, 0 = removed (avoids frequent delete)
+    const tzMap = Object.create(null); // timers map (id -> 1/0)
+    const azMap = Object.create(null); // raf map (id -> 1/0)
 
-    const nativeReportError =
-        typeof reportError === "function" ? reportError : null;
+    const tzAdd = (id) => { tzMap[id] = 1; };
+    const tzHas = (id) => tzMap[id] === 1;
+    const tzDelete = (id) => { tzMap[id] = 0; };
 
+    const azAdd = (id) => { azMap[id] = 1; };
+    const azHas = (id) => azMap[id] === 1;
+    const azDelete = (id) => { azMap[id] = 0; };
+
+    // --- error forwarding ---
+    const nativeReportError = typeof reportError === "function" ? reportError : null;
     const errCatch = (e) => {
         if (nativeReportError) {
             nativeReportError(e);
         } else {
-            queueMicrotask_(() => {
-                throw e;
-            });
+            queueMicrotask_(() => { throw e; });
         }
     };
 
-    const dOffset = 2 ** -26;
+    const dOffset = 2 ** -26; // tiny adjust to avoid hitting timer coalescing boundaries
 
-    const runTask = (f, args) => {
+    // --- run task: inline specialized call handling (0/1/2 args) ---
+    const callWithArgs = (f, singleArg, args) => {
         if (args === null) {
-            f();
+            if (singleArg === undefined) {
+                // zero args
+                f();
+            } else {
+                // singleArg fast path
+                f(singleArg);
+            }
         } else {
-            Reflect_apply(f, win, args);
+            // small-args fast path or fallback
+            const al = args.length;
+            if (al === 1) f(args[0]);
+            else if (al === 2) f(args[0], args[1]);
+            else f.apply(win, args);
         }
     };
 
-    // --- OBJECT POOLING & DOUBLE BUFFERING ---
+    // --- object pooling (pre-shaped objects for stable hidden classes) ---
+    const timerObjPool = [];
+    const rafObjPool = [];
 
-    // 1. TIMERS
+    const getTimerObj = (id, f, singleArg, args, isInterval) => {
+        let t = timerObjPool.pop();
+        if (!t) {
+            // pre-shape: all properties declared in order
+            t = { id: 0, f: null, singleArg: undefined, args: null, isInterval: false };
+        }
+        t.id = id;
+        t.f = f;
+        t.singleArg = singleArg;
+        t.args = args;
+        t.isInterval = !!isInterval;
+        return t;
+    };
+
+    const recycleTimerObj = (t) => {
+        // clear references
+        t.f = null;
+        t.singleArg = undefined;
+        t.args = null;
+        t.isInterval = false;
+        // keep id to help predictability (optional)
+        t.id = 0;
+        timerObjPool.push(t);
+    };
+
+    const getRafObj = (id, f, timeRes) => {
+        let r = rafObjPool.pop();
+        if (!r) {
+            r = { id: 0, f: null, timeRes: 0 };
+        }
+        r.id = id;
+        r.f = f;
+        r.timeRes = timeRes;
+        return r;
+    };
+
+    const recycleRafObj = (r) => {
+        r.f = null;
+        r.timeRes = 0;
+        r.id = 0;
+        rafObjPool.push(r);
+    };
+
+    // --- double-buffered queues ---
     let activeTimerQueue = [];
     let flushTimerQueue = [];
     let isTimerFlushScheduled = false;
 
-    // Recycle object pool for Timers to avoid GC
-    const timerObjPool = [];
-    const getTimerObj = (id, f, args, isInterval) => {
-        let t = timerObjPool.pop();
-        if (!t) t = {};
-        t.id = id;
-        t.f = f;
-        t.args = args;
-        t.isInterval = isInterval;
-        return t;
-    };
+    let activeRafQueue = [];
+    let flushRafQueue = [];
+    let isRafFlushScheduled = false;
 
+    // --- FLUSH: Timers ---
     const flushTimers = () => {
         isTimerFlushScheduled = false;
 
-        // Trigger heartbeat
-        if (lastPr !== pr) {
-            lastPr = pr;
-            port2.postMessage(null);
-        }
+        // heartbeat
+        poke();
 
-        Promise_.resolve().then(() => {
-            // Swap Buffers: active becomes execution, execution becomes active (empty)
+        // schedule microtask to run the queued tasks (coalesced)
+        queueMicrotask_(() => {
+            // swap buffers
             const tasks = activeTimerQueue;
             activeTimerQueue = flushTimerQueue;
             flushTimerQueue = tasks;
@@ -172,28 +263,39 @@
             const len = tasks.length;
             if (len === 0) return;
 
+            // iterate with cached locals
             for (let i = 0; i < len; i++) {
                 const task = tasks[i];
-                const { id, f, args, isInterval } = task;
 
-                // Check existence
-                if (isInterval ? tz.has(id) : tz.delete(id)) {
+                const id = task.id;
+                const f = task.f;
+                const singleArg = task.singleArg;
+                const args = task.args;
+                const isInterval = task.isInterval;
+
+                // existence check: if interval -> must have active flag; if timeout -> consume/deactivate
+                if (isInterval ? tzHas(id) : (tzDelete(id), tzMap[id] === 0)) {
+                    // For setTimeout: tzDelete already set to 0 above.
                     try {
-                        runTask(f, args);
+                        callWithArgs(f, singleArg, args);
+                    } catch (e) {
+                        errCatch(e);
+                    }
+                } else if (isInterval && tzHas(id)) {
+                    // unreachable due to branch logic but preserved for clarity
+                    try {
+                        callWithArgs(f, singleArg, args);
                     } catch (e) {
                         errCatch(e);
                     }
                 }
 
-                // Cleanup & Return to Pool
-                task.args = null;
-                task.f = null;
-                timerObjPool.push(task);
+                // cleanup object and recycle
+                recycleTimerObj(task);
 
-                // Clear index to help GC if the array stays large
-                tasks[i] = null;
+                // do not null tasks[i]; keep array buffer and just reset length
             }
-            // Reset length without deallocating the array
+
             tasks.length = 0;
         });
     };
@@ -201,33 +303,15 @@
     const scheduleTimerFlush = () => {
         if (isTimerFlushScheduled) return;
         isTimerFlushScheduled = true;
-        if (lastPr !== pr) {
-            lastPr = pr;
-            port2.postMessage(null);
-        }
+        poke();
         pr.then(flushTimers);
     };
 
-    // 2. RAF
-    let activeRafQueue = [];
-    let flushRafQueue = [];
-    let isRafFlushScheduled = false;
-
-    // Recycle object pool for RAF
-    const rafObjPool = [];
-    const getRafObj = (id, f, timeRes) => {
-        let t = rafObjPool.pop();
-        if (!t) t = {};
-        t.id = id;
-        t.f = f;
-        t.timeRes = timeRes;
-        return t;
-    };
-
+    // --- FLUSH: RAF ---
     const flushRafs = () => {
         isRafFlushScheduled = false;
 
-        // Swap Buffers
+        // swap buffers
         const tasks = activeRafQueue;
         activeRafQueue = flushRafQueue;
         flushRafQueue = tasks;
@@ -236,29 +320,28 @@
         if (len === 0) return;
 
         const q1 = getTimelineTime();
+        poke();
 
-        if (lastPr !== pr) {
-            lastPr = pr;
-            port2.postMessage(null);
-        }
+        // Cache timeline once per flush (qNow)
+        const qNow = getTimelineTime();
 
         for (let i = 0; i < len; i++) {
             const task = tasks[i];
-            const { id, f } = task;
+            const id = task.id;
+            const f = task.f;
+            const timeRes = task.timeRes;
 
-            if (az.delete(id)) {
+            // only run if still active
+            if (azHas(id)) {
                 try {
-                    // optimization: calc adjustment inside strict scope
-                    f(task.timeRes + (getTimelineTime() - q1));
+                    // adjust time delta using the cached qNow and q1
+                    f(timeRes + (qNow - q1));
                 } catch (e) {
                     errCatch(e);
                 }
             }
 
-            // Cleanup & Return to Pool
-            task.f = null;
-            rafObjPool.push(task);
-            tasks[i] = null;
+            recycleRafObj(task);
         }
         tasks.length = 0;
     };
@@ -269,54 +352,73 @@
         upr.then(flushRafs);
     };
 
-    // --- TIMEOUT / INTERVAL OVERRIDES ---
+    // --- OVERRIDE: setTimeout / setInterval / clearX ---
+    // Special-case args allocation: 0 args -> singleArg undefined; 1 arg -> singleArg; >1 -> array
 
     setTimeout = function (f, d) {
+        let argLen = arguments.length;
         let args = null;
-        const argLen = arguments.length;
+        let singleArg = undefined;
+
         if (argLen > 2) {
-            args = new Array(argLen - 2);
-            for (let i = 2; i < argLen; i++) args[i - 2] = arguments[i];
+            if (argLen === 3) {
+                singleArg = arguments[2];
+            } else if (argLen === 4) {
+                // two args - store array of 2 to avoid dynamic resizing in hot path
+                args = [arguments[2], arguments[3]];
+            } else {
+                args = new Array(argLen - 2);
+                for (let i = 2; i < argLen; i++) args[i - 2] = arguments[i];
+            }
         }
 
         if (typeof f !== "function") {
-            return setTimeout_(f, d, ...(args || []));
+            // push through to native; keep provided args shape
+            return setTimeout_(f, d, ...(args ? args : (singleArg === undefined ? [] : [singleArg])));
         }
 
         let id;
         const wrapper = () => {
-            if (!tz.has(id)) return;
-            // Use Object Pool and push to Active Buffer
-            activeTimerQueue.push(getTimerObj(id, f, args, false));
+            // schedule pooled task if still active
+            // note: wrapper captures nothing but id
+            if (!tzHas(id)) return;
+            activeTimerQueue.push(getTimerObj(id, f, singleArg, args, false));
             scheduleTimerFlush();
         };
 
-        // Strict type coercion to ensure math speed
+        // ensure d is a number and adjust slightly if >1 for coalescing consistency
         d = +d;
         if (d > 1) d -= dOffset;
 
         id = setTimeout_(wrapper, d);
-        tz.add(id);
+        tzAdd(id);
         return id;
     };
 
     setInterval = function (f, d) {
+        let argLen = arguments.length;
         let args = null;
-        const argLen = arguments.length;
+        let singleArg = undefined;
+
         if (argLen > 2) {
-            args = new Array(argLen - 2);
-            for (let i = 2; i < argLen; i++) args[i - 2] = arguments[i];
+            if (argLen === 3) {
+                singleArg = arguments[2];
+            } else if (argLen === 4) {
+                args = [arguments[2], arguments[3]];
+            } else {
+                args = new Array(argLen - 2);
+                for (let i = 2; i < argLen; i++) args[i - 2] = arguments[i];
+            }
         }
 
         if (typeof f !== "function") {
-            return setInterval_(f, d, ...(args || []));
+            return setInterval_(f, d, ...(args ? args : (singleArg === undefined ? [] : [singleArg])));
         }
 
         let id;
         const wrapper = () => {
-            if (!tz.has(id)) return;
-            // Use Object Pool and push to Active Buffer
-            activeTimerQueue.push(getTimerObj(id, f, args, true));
+            if (!tzHas(id)) return;
+            activeTimerQueue.push(getTimerObj(id, f, singleArg, args, true));
             scheduleTimerFlush();
         };
 
@@ -324,46 +426,58 @@
         if (d > 1) d -= dOffset;
 
         id = setInterval_(wrapper, d);
-        tz.add(id);
+        tzAdd(id);
         return id;
     };
 
     clearTimeout = function (cid) {
-        tz.delete(cid);
+        // mark as removed; leave key in object map to avoid delete overhead
+        tzDelete(cid);
         return clearTimeout_(cid);
     };
 
     clearInterval = function (cid) {
-        tz.delete(cid);
+        tzDelete(cid);
         return clearInterval_(cid);
     };
 
-    // --- RAF OVERRIDE ---
-
+    // --- OVERRIDE: requestAnimationFrame / cancelAnimationFrame ---
     requestAnimationFrame = function (f) {
         let id;
-        const upr = pr;
+        const upr = pr; // capture current heartbeat promise
 
         const wrapper = (timeRes) => {
-            // Use Object Pool and push to Active Buffer
             activeRafQueue.push(getRafObj(id, f, timeRes));
             scheduleRafFlush(upr);
         };
 
-        if (lastPr !== pr) {
-            lastPr = pr;
-            port2.postMessage(null);
-        }
-
+        poke();
         id = requestAnimationFrame_(wrapper);
-        az.add(id);
+        azAdd(id);
         return id;
     };
 
     cancelAnimationFrame = function (aid) {
-        az.delete(aid);
+        azDelete(aid);
         return cancelAnimationFrame_(aid);
     };
+
+    // --- WebGL-specific considerations & cheap detection ---
+    // This script does not change WebGL state, but heavy GL pages often use many RAFs and upload buffers.
+    // Two light-weight tactics you can enable below (commented) if you want more aggressive CPU/GPU throttling:
+    // Visibility-based RAF throttle: if document.hidden -> avoid scheduling RAF flushes entirely.
+
+    const webglDetected = (function () {
+        try {
+            // cheap check without keeping a reference to the context
+            const canvas = document.createElement("canvas");
+            return !!(canvas.getContext && (canvas.getContext("webgl") || canvas.getContext("experimental-webgl")));
+        } catch (e) {
+            return false;
+        }
+    })();
+
+    // End of IIFE
 })([
     setTimeout,
     setInterval,
