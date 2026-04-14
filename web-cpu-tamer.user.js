@@ -55,394 +55,331 @@ SOFTWARE.
 // @run-at       document-start
 // ==/UserScript==
 
-/* jshint esversion: 11 */
+/* jshint esversion: 8 */
 
-((globalObject) => {
-    "use strict";
+((nativeApis) => {
+  'use strict';
 
-    // ========================================================================
-    // 1. ENGINE REFERENCE CACHING & INITIALIZATION
-    // ========================================================================
-    // Bypass prototype chain lookups by caching native references immediately.
-    // We prefer unsafeWindow (Tampermonkey/Violentmonkey) for direct access,
-    // falling back to the global object if necessary.
-    const win = typeof unsafeWindow === "object" && unsafeWindow !== null ? unsafeWindow : globalObject;
+  // Optimization: Configuration flags as constants to allow V8 to dead-code eliminate branches if set to false
+  const HACK_TOSTRING = false;
+  const HACK_VALUEOF = false;
 
-    // Singleton flag to prevent multiple injections which would degrade performance
-    const HKEY = "_aideveloper_v8_opt_v3";
-    if (win[HKEY]) return;
-    win[HKEY] = true;
+  // Optimization: Direct array destructuring is fast, but we cache them locally to avoid scope lookups
+  const[
+    setTimeout_, 
+    setInterval_, 
+    requestAnimationFrame_, 
+    clearTimeout_, 
+    clearInterval_, 
+    cancelAnimationFrame_
+  ] = nativeApis;
+  
+  const queueMicrotask_ = queueMicrotask;
+  
+  // Resolve global window context reliably
+  const win = typeof window.wrappedJSObject === 'object' 
+    ? window.wrappedJSObject 
+    : typeof unsafeWindow === 'object' 
+      ? unsafeWindow 
+      : this instanceof Window 
+        ? this 
+        : window;
 
-    // Cache unadulterated native functions to avoid recursion and performance loss
-    const N_setTimeout = win.setTimeout;
-    const N_clearTimeout = win.clearTimeout;
-    const N_setInterval = win.setInterval;
-    const N_clearInterval = win.clearInterval;
-    const N_requestAnimationFrame = win.requestAnimationFrame;
-    const N_cancelAnimationFrame = win.cancelAnimationFrame;
-    const N_addEventListener = win.EventTarget.prototype.addEventListener;
-    const N_getContext = win.HTMLCanvasElement.prototype.getContext;
+  // Single-execution lock to prevent duplicated userscript injection
+  const hkey_script = 'nzsxclvflluv_v8_optimized';
+  if (win[hkey_script]) throw new Error('WebCPUTamer: Duplicated Userscript Calling'); 
+  win[hkey_script] = true;
 
-    // High-precision timer binding
-    const perf = win.performance;
-    const N_now = (perf && perf.now) ? perf.now.bind(perf) : win.Date.now;
+  /** @type {globalThis.PromiseConstructor} */
+  const Promise = (async () => { })().constructor; // Hack to bypass YouTube/WaterFox Promise modifications
 
-    // Error Handling: Defer errors to the microtask queue to prevent
-    // blocking the optimized execution loop.
-    const throwErr = (e) => queueMicrotask(() => { throw e; });
+  // Promise resolution state
+  let resolvePr = () => {};
+  let pr = null;
+  let lastPr = null;
 
-    // ========================================================================
-    // 2. ZERO-ALLOCATION DOUBLE-BUFFERED QUEUES
-    // ========================================================================
-    // V8 optimizes Arrays with contiguous integer indices (SMI).
-    // We avoid `push`, `pop`, and spread operators `...args` to prevent
-    // heap allocations and subsequent Garbage Collection (GC) pauses.
-    const QUEUE_SIZE = 16384;
+  /**
+   * Generates a new promise and exposes its resolver function.
+   */
+  const setPr = () => {
+    pr = new Promise((resolve) => {
+      resolvePr = resolve;
+    });
+  };
+  setPr();
 
-    // Timer Queues (setTimeout/setInterval)
-    let tqActive = new Array(QUEUE_SIZE);
-    let tqFlush  = new Array(QUEUE_SIZE);
-    let tqActiveLen = 0;
+  // Optimization: TextNode is slightly faster than Comment for Blink/V8 microtask triggering
+  const cme = document.createTextNode(''); 
+  let cmi = 0;
+  
+  // V8 cached strings to avoid recurrent allocation
+  const TICK_A = '+'; 
+  const TICK_B = '-';
 
-    // 0ms Bypass Queues (Immediate execution without nesting clamp)
-    let zqActive = new Array(QUEUE_SIZE);
-    let zqFlush  = new Array(QUEUE_SIZE);
-    let zqActiveLen = 0;
-
-    // RAF Queues (requestAnimationFrame)
-    let rqActive = new Array(QUEUE_SIZE);
-    let rqFlush  = new Array(QUEUE_SIZE);
-    let rqActiveLen = 0;
-
-    // Pre-shape queue objects to guarantee Monomorphic Hidden Classes in V8.
-    // This prevents V8 from transitioning the objects to "dictionary mode"
-    // which is significantly slower.
-    for (let i = 0; i < QUEUE_SIZE; i++) {
-        // Timer Task Shape
-        tqActive[i] = { id: 0, f: null, a: null, b: null, c: null, d: null, argsLen: 0, isInt: false };
-        tqFlush[i]  = { id: 0, f: null, a: null, b: null, c: null, d: null, argsLen: 0, isInt: false };
-        zqActive[i] = { id: 0, f: null, a: null, b: null, c: null, d: null, argsLen: 0, isInt: false };
-        zqFlush[i]  = { id: 0, f: null, a: null, b: null, c: null, d: null, argsLen: 0, isInt: false };
-
-        // RAF Task Shape (Simpler structure)
-        rqActive[i] = { id: 0, f: null };
-        rqFlush[i]  = { id: 0, f: null };
+  /**
+   * Triggers the MutationObserver microtask batcher.
+   * Ensures the operation is monomorphic and utilizes bitwise SMI toggling.
+   */
+  function act() {
+    if (lastPr !== pr) {
+      lastPr = pr;
+      // SMI bitwise toggle (0 or 1) - extremely fast in V8
+      cmi ^= 1; 
+      cme.data = cmi === 1 ? TICK_A : TICK_B;
     }
+  }
 
-    // State Tracking: V8 Dictionary Mode optimized for SMI keys.
-    // 1 = Active, 0 = Cleared/Aborted.
-    const activeStates = Object.create(null);
+  /**
+   * Helper to trigger microtask efficiently without duplicating the `lastPr` check.
+   */
+  function triggerAct() {
+    if (lastPr !== pr) queueMicrotask_(act);
+  }
 
-    // ========================================================================
-    // 3. FAST-PATH EXECUTION ENGINE
-    // ========================================================================
-    // Directly calls the function based on argument count to avoid the
-    // overhead of `Function.prototype.apply`.
-    const executeTask = (task, timestamp = null) => {
-        const f = task.f;
-        if (!f) return;
+  /**
+   * High-performance Timeline Polyfill.
+   * Falls back to performance.now() avoiding costly try/catch deoptimizations during runtime.
+   */
+  class PseudoTimeline {
+    constructor() {
+      const perf = performance;
+      // Cache timeOrigin to avoid continuous getter lookups
+      this.startTime = perf.timeOrigin || perf.now();
+    }
+    get currentTime() {
+      return performance.now() - this.startTime;
+    }
+  }
 
-        try {
-            if (timestamp !== null) {
-                // RAF path: passes timestamp
-                f(timestamp);
-            } else {
-                // Timer path: switches based on argument length (Micro-optimization)
-                switch (task.argsLen) {
-                    case 0: f(); break;
-                    case 1: f(task.a); break;
-                    case 2: f(task.a, task.b); break;
-                    case 3: f(task.a, task.b, task.c); break;
-                    case 4: f(task.a, task.b, task.c, task.d); break;
-                    // Note: In a full production engine, we might fall back to apply here,
-                    // but for this micro-optimized scope, we cap at 4 args to maintain speed.
-                }
-            }
-        } catch (e) {
-            throwErr(e);
-        } finally {
-            // Critical: Nullify references immediately to assist Garbage Collection.
-            // This prevents memory leaks if the user function captures large scope variables.
-            task.f = null;
-            task.a = null;
-            task.b = null;
-            task.c = null;
-            task.d = null;
+  let tl;
+  if (typeof DocumentTimeline === 'function') {
+    tl = new DocumentTimeline();
+  } else if (typeof Animation === 'function') {
+    try {
+      let e = document.documentElement;
+      let AnimationConstructor = Animation;
+      if (e) {
+        e = e.animate(null);
+        if (typeof (e || 0) === 'object' && '_animation' in e && e.constructor === Object) {
+          e = e._animation;
         }
-    };
-
-    // ========================================================================
-    // 4. THE 0MS MACRO-TASK BYPASS
-    // ========================================================================
-    // Uses MessageChannel to bypass the 4ms minimum nesting clamp of setTimeout.
-    // This allows DOM updates to happen in the next frame without artificial delay.
-    const mc = new MessageChannel();
-    let isZeroDelayScheduled = false;
-
-    mc.port1.onmessage = () => {
-        isZeroDelayScheduled = false;
-        if (zqActiveLen === 0) return;
-
-        // Atomic Buffer Swap: Swaps the active and flush buffers.
-        // This is O(1) and prevents allocation.
-        const tasks = zqActive;
-        const len = zqActiveLen;
-        zqActive = zqFlush;
-        zqFlush = tasks;
-        zqActiveLen = 0;
-
-        for (let i = 0; i < len; i++) {
-            const task = tasks[i];
-            if (activeStates[task.id] === 1) {
-                activeStates[task.id] = 0; // 0ms is always treated as a one-off timeout
-                executeTask(task);
-            } else {
-                // Task was cleared before execution; cleanup references.
-                task.f = null; task.a = null; task.b = null; task.c = null; task.d = null;
-            }
+        if (typeof (e || 0) === 'object' && 'timeline' in e && typeof e.constructor === 'function') {
+          AnimationConstructor = e.constructor;
         }
+      }
+      tl = new AnimationConstructor().timeline;
+    } catch (err) {
+      // Ignored safely during init
+    }
+  }
+  
+  // Verify timeline validity, fallback to optimized pseudo timeline
+  if (!tl || !Number.isFinite(tl.currentTime || null)) tl = new PseudoTimeline();
+  const tl_ = tl;
+
+  // Core MutationObserver for microtask timing
+  const mo = new MutationObserver(() => {
+    resolvePr();
+    setPr();
+  });
+  mo.observe(cme, { characterData: true });
+
+  // Tracking Sets. V8 handles sets of SMIs (integers) extremely efficiently.
+  const tz = new Set();
+  const az = new Set();
+
+  /**
+   * Core yielding logic for Timeouts/Intervals.
+   */
+  const h1 = async (r) => {
+    tz.add(r);
+    triggerAct();
+    await pr;
+    triggerAct();
+    await pr;
+    return tz.delete(r);
+  };
+
+  /**
+   * Core yielding logic for Animation Frames.
+   */
+  const h2 = async (r, upr) => {
+    az.add(r);
+    await upr;
+    return az.delete(r);
+  };
+
+  /**
+   * Safe execution context escape to avoid microtask blockage.
+   */
+  const errCatch = (e) => {
+    queueMicrotask_(() => { throw e; });
+  };
+
+  // Pre-calculated offset (2 ** -26) kept as a strict Double to optimize V8 math operations
+  const dOffset = 0.000000014901161193847656;
+
+  /**
+   * GLOBALLY DEFINED HANDLERS
+   * Optimization: Moving async handlers out of the wrapper closures completely eliminates 
+   * the creation of nested Promises/closures every time a timer ticks.
+   */
+  const runTimerCallback = async (id, cb, args) => {
+    try {
+      const isValid = await h1(id);
+      if (isValid) {
+        // Fast path branching
+        if (args === undefined) cb();
+        else cb(...args);
+      }
+    } catch (e) {
+      errCatch(e);
+    }
+  };
+
+  const runRafCallback = async (id, cb, timeRes, q1, upr) => {
+    try {
+      const isValid = await h2(id, upr);
+      if (isValid) {
+        cb(timeRes + (tl_.currentTime - q1));
+      }
+    } catch (e) {
+      errCatch(e);
+    }
+  };
+
+  /**
+   * Patched setTimeout
+   */
+  setTimeout = function (f, d = void 0, ...args) {
+    if (typeof f !== 'function') return setTimeout_(f, d, ...args); // Native fallback for string eval
+    if (d >= 1) d -= dOffset;
+
+    let r;
+    // Optimization: Avoid argument array allocations for parameterless callbacks (very common)
+    const g = args.length === 0 
+      ? () => runTimerCallback(r, f, undefined)
+      : (...cbArgs) => runTimerCallback(r, f, cbArgs);
+
+    r = setTimeout_(g, d, ...args);
+    return r;
+  };
+
+  /**
+   * Patched setInterval
+   */
+  setInterval = function (f, d = void 0, ...args) {
+    if (typeof f !== 'function') return setInterval_(f, d, ...args);
+    if (d >= 1) d -= dOffset;
+
+    let r;
+    const g = args.length === 0 
+      ? () => runTimerCallback(r, f, undefined)
+      : (...cbArgs) => runTimerCallback(r, f, cbArgs);
+
+    r = setInterval_(g, d, ...args);
+    return r;
+  };
+
+  /**
+   * Patched clearTimeout
+   */
+  clearTimeout = function (cid) {
+    if (cid != null) tz.delete(cid);
+    return clearTimeout_(cid);
+  };
+
+  /**
+   * Patched clearInterval
+   */
+  clearInterval = function (cid) {
+    if (cid != null) tz.delete(cid);
+    return clearInterval_(cid);
+  };
+
+  /**
+   * Patched requestAnimationFrame
+   */
+  requestAnimationFrame = function (f) {
+    if (typeof f !== 'function') return requestAnimationFrame_(f); // Safe Native fallback
+
+    let r;
+    const upr = pr;
+    triggerAct();
+    
+    // Extracted logic to keep closure lightweight
+    const g = (timeRes) => {
+      const q1 = tl_.currentTime;
+      runRafCallback(r, f, timeRes, q1, upr);
     };
 
-    // ========================================================================
-    // 5. PHASE-ACCURATE RAF AND TIMER FLUSHERS
-    // ========================================================================
-    let isTimerFlushScheduled = false;
-    let isRafFlushScheduled = false;
+    r = requestAnimationFrame_(g);
+    return r;
+  };
 
-    const flushTimers = () => {
-        isTimerFlushScheduled = false;
+  /**
+   * Patched cancelAnimationFrame
+   */
+  cancelAnimationFrame = function (aid) {
+    if (aid != null) az.delete(aid);
+    return cancelAnimationFrame_(aid);
+  };
 
-        if (tqActiveLen === 0) return;
+  // Implement Prototype/String patching if required via configuration
+  if (HACK_TOSTRING) {
+    setTimeout.toString = setTimeout_.toString.bind(setTimeout_);
+    setInterval.toString = setInterval_.toString.bind(setInterval_);
+    clearTimeout.toString = clearTimeout_.toString.bind(clearTimeout_);
+    clearInterval.toString = clearInterval_.toString.bind(clearInterval_);
+    requestAnimationFrame.toString = requestAnimationFrame_.toString.bind(requestAnimationFrame_);
+    cancelAnimationFrame.toString = cancelAnimationFrame_.toString.bind(cancelAnimationFrame_);
+  }
 
-        // Buffer Swap
-        const tasks = tqActive;
-        const len = tqActiveLen;
-        tqActive = tqFlush;
-        tqFlush = tasks;
-        tqActiveLen = 0;
+  if (HACK_VALUEOF) {
+    setTimeout.valueOf = setTimeout_.valueOf.bind(setTimeout_);
+    setInterval.valueOf = setInterval_.valueOf.bind(setInterval_);
+    clearTimeout.valueOf = clearTimeout_.valueOf.bind(clearTimeout_);
+    clearInterval.valueOf = clearInterval_.valueOf.bind(clearInterval_);
+    requestAnimationFrame.valueOf = requestAnimationFrame_.valueOf.bind(requestAnimationFrame_);
+    cancelAnimationFrame.valueOf = cancelAnimationFrame_.valueOf.bind(cancelAnimationFrame_);
+  }
 
-        for (let i = 0; i < len; i++) {
-            const task = tasks[i];
-            if (activeStates[task.id] === 1) {
-                if (!task.isInt) {
-                    activeStates[task.id] = 0; // Mark as inactive for one-off timeouts
-                }
-                executeTask(task);
-            } else {
-                // Cleanup for cleared tasks
-                task.f = null; task.a = null; task.b = null; task.c = null; task.d = null;
-            }
-        }
+  // Cross-environment Export (FireMonkey / ViolentMonkey / GreaseMonkey / Contexts)
+  const isContentScript = (
+    typeof window.wrappedJSObject === 'object' && 
+    typeof unsafeWindow === 'object' && 
+    typeof exportFunction === 'function'
+  ) || (
+    typeof GM === 'object' && 
+    ((GM || 0).info || 0).injectInto === 'content'
+  );
+
+  if (isContentScript) {
+    const exportFn = (f, name) => {
+      if (typeof exportFunction === 'function') {
+        exportFunction(f, win, { defineAs: name, allowCrossOriginArguments: true });
+      } else {
+        win[name] = f;
+      }
     };
+    
+    exportFn(setTimeout, 'setTimeout');
+    exportFn(setInterval, 'setInterval');
+    exportFn(requestAnimationFrame, 'requestAnimationFrame');
+    exportFn(clearTimeout, 'clearTimeout');
+    exportFn(clearInterval, 'clearInterval');
+    exportFn(cancelAnimationFrame, 'cancelAnimationFrame');
+    
+    // Unique fingerprint generator
+    const uniqueId = Math.floor(Math.random() * 314159265359 + 314159265359).toString(36);
+    exportFn(() => 1, `webCPUTamer_V8_${uniqueId}`);
+  }
 
-    const flushRafs = (timestamp) => {
-        isRafFlushScheduled = false;
-
-        if (rqActiveLen === 0) return;
-
-        // Buffer Swap
-        const tasks = rqActive;
-        const len = rqActiveLen;
-        rqActive = rqFlush;
-        rqFlush = tasks;
-        rqActiveLen = 0;
-
-        for (let i = 0; i < len; i++) {
-            const task = tasks[i];
-            if (activeStates[task.id] === 1) {
-                activeStates[task.id] = 0; // RAF is inherently one-off per request
-                executeTask(task, timestamp);
-            } else {
-                task.f = null;
-            }
-        }
-    };
-
-    // ========================================================================
-    // 6. TIMER OVERRIDES
-    // ========================================================================
-    // Custom ID counter using negative SMI (Small Integer) space.
-    // This guarantees no collision with native positive IDs returned by browser.
-    let customIdCounter = -2147483648;
-
-    win.setTimeout = function (f, delay, a, b, c, d) {
-        if (typeof f !== "function") return N_setTimeout.apply(win, arguments);
-
-        delay = Number(delay) || 0;
-        // Explicitly counting arguments to avoid `arguments.length` lookup overhead in hot path
-        const argsLen = arguments.length > 2 ? arguments.length - 2 : 0;
-
-        // OPTIMIZATION: Bypass 4ms clamp for 0ms delays
-        if (delay <= 0) {
-            const id = customIdCounter++;
-            activeStates[id] = 1;
-
-            if (zqActiveLen < QUEUE_SIZE) {
-                const task = zqActive[zqActiveLen++];
-                task.id = id; task.f = f; task.isInt = false; task.argsLen = argsLen;
-                if (argsLen > 0) { task.a = a; task.b = b; task.c = c; task.d = d; }
-            } else {
-                console.warn("[V8Opt] Zero-delay queue overflow, task dropped.");
-            }
-
-            if (!isZeroDelayScheduled) {
-                isZeroDelayScheduled = true;
-                mc.port2.postMessage(0);
-            }
-            return id;
-        }
-
-        // Standard path for delays > 0
-        let id;
-        const wrapper = () => {
-            if (activeStates[id] !== 1) return;
-
-            if (tqActiveLen < QUEUE_SIZE) {
-                const task = tqActive[tqActiveLen++];
-                task.id = id; task.f = f; task.isInt = false; task.argsLen = argsLen;
-                if (argsLen > 0) { task.a = a; task.b = b; task.c = c; task.d = d; }
-            }
-
-            if (!isTimerFlushScheduled) {
-                isTimerFlushScheduled = true;
-                // Use microtask to flush before the next paint
-                queueMicrotask(flushTimers);
-            }
-        };
-
-        id = N_setTimeout(wrapper, delay);
-        activeStates[id] = 1;
-        return id;
-    };
-
-    win.setInterval = function (f, delay, a, b, c, d) {
-        if (typeof f !== "function") return N_setInterval.apply(win, arguments);
-
-        delay = Number(delay) || 0;
-        const argsLen = arguments.length > 2 ? arguments.length - 2 : 0;
-
-        let id;
-        const wrapper = () => {
-            if (activeStates[id] !== 1) return;
-
-            if (tqActiveLen < QUEUE_SIZE) {
-                const task = tqActive[tqActiveLen++];
-                task.id = id; task.f = f; task.isInt = true; task.argsLen = argsLen;
-                if (argsLen > 0) { task.a = a; task.b = b; task.c = c; task.d = d; }
-            }
-
-            if (!isTimerFlushScheduled) {
-                isTimerFlushScheduled = true;
-                queueMicrotask(flushTimers);
-            }
-        };
-
-        id = N_setInterval(wrapper, delay);
-        activeStates[id] = 1;
-        return id;
-    };
-
-    win.clearTimeout = function (id) {
-        if (id == null) return;
-        activeStates[id] = 0;
-        // Only call native clear if ID is positive (Native ID)
-        if (id > 0) N_clearTimeout(id);
-    };
-
-    win.clearInterval = function (id) {
-        if (id == null) return;
-        activeStates[id] = 0;
-        if (id > 0) N_clearInterval(id);
-    };
-
-    // ========================================================================
-    // 7. ANIMATION FRAME OVERRIDE (VSYNC ALIGNMENT)
-    // ========================================================================
-    win.requestAnimationFrame = function (f) {
-        if (typeof f !== "function") return N_requestAnimationFrame.apply(win, arguments);
-
-        let id;
-        const wrapper = (timestamp) => {
-            if (activeStates[id] !== 1) return;
-
-            if (rqActiveLen < QUEUE_SIZE) {
-                const task = rqActive[rqActiveLen++];
-                task.id = id;
-                task.f = f;
-            }
-
-            if (!isRafFlushScheduled) {
-                isRafFlushScheduled = true;
-                // EXECUTED SYNCHRONOUSLY inside the native RAF task.
-                // This ensures we utilize the same frame context the browser provided.
-                flushRafs(timestamp);
-            }
-        };
-
-        id = N_requestAnimationFrame(wrapper);
-        activeStates[id] = 1;
-        return id;
-    };
-
-    win.cancelAnimationFrame = function (id) {
-        if (id == null) return;
-        activeStates[id] = 0;
-        N_cancelAnimationFrame(id);
-    };
-
-    // ========================================================================
-    // 8. EVENT COMPOSITOR OPTIMIZATION
-    // ========================================================================
-    // Forces passive event listeners for wheel/touch events to prevent
-    // blocking the main thread during scrolling.
-    const PASSIVE_EVENTS = {
-        'wheel': 1,
-        'mousewheel': 1,
-        'touchstart': 1,
-        'touchmove': 1
-    };
-
-    win.EventTarget.prototype.addEventListener = function (type, listener, options) {
-        if (PASSIVE_EVENTS[type] === 1) {
-            if (options === undefined || options === null) {
-                options = { passive: true };
-            } else if (typeof options === 'boolean') {
-                options = { capture: options, passive: true };
-            } else if (typeof options === 'object' && !options.passive) {
-                // Object spread is safer than mutating the user-provided object directly
-                options = { ...options, passive: true };
-            }
-        }
-        return N_addEventListener.call(this, type, listener, options);
-    };
-
-    // ========================================================================
-    // 9. CANVAS / WEBGL DIRECT-TO-GPU OPTIMIZATIONS
-    // ========================================================================
-    // Modifies context creation to enable `desynchronized`
-    win.HTMLCanvasElement.prototype.getContext = function (contextType, contextAttributes) {
-        const isGL = contextType === 'webgl' || contextType === 'webgl2' || contextType === 'experimental-webgl';
-        const is2D = contextType === '2d';
-
-        if (isGL || is2D) {
-            if (contextAttributes === undefined || contextAttributes === null) {
-                contextAttributes = {};
-            } else if (typeof contextAttributes !== 'object') {
-                contextAttributes = {};
-            } else {
-                // Clone to prevent mutating application state
-                contextAttributes = { ...contextAttributes };
-            }
-
-            // Desynchronized: Allows the browser to schedule rendering separate
-            // from the compositor, reducing input latency.
-            if (!('desynchronized' in contextAttributes)) {
-                contextAttributes.desynchronized = true;
-            }
-
-        }
-
-        return N_getContext.call(this, contextType, contextAttributes);
-    };
-
-})(this);
+})([
+  setTimeout, 
+  setInterval, 
+  requestAnimationFrame, 
+  clearTimeout, 
+  clearInterval, 
+  cancelAnimationFrame
+]);
